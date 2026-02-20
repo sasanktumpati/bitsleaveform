@@ -5,7 +5,6 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   build: {
-    minify: 'esbuild',
     sourcemap: false,
     cssMinify: true,
     target: 'es2020',
@@ -21,11 +20,7 @@ export default defineConfig({
           if (id.includes('/node_modules/docx/')) {
             return 'docx-vendor'
           }
-          if (
-            id.includes('/node_modules/jspdf/') ||
-            id.includes('/node_modules/html2canvas/') ||
-            id.includes('/node_modules/dompurify/')
-          ) {
+          if (id.includes('/node_modules/pdf-lib/')) {
             return 'pdf-vendor'
           }
           return undefined

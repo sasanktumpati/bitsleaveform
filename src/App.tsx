@@ -308,95 +308,142 @@ const buildDocxDocument = async (formData: FormState, signatureImage: DocSignatu
 }
 
 const buildPdfBlob = async (formData: FormState): Promise<Blob> => {
-  const { jsPDF } = await import('jspdf')
-  const pdf = new jsPDF({ unit: 'pt', format: 'a4' })
-  const left = 56
-  const width = 483
-  let y = 70
+  const { PDFDocument, StandardFonts, rgb } = await import('pdf-lib')
 
-  const addWrapped = (text: string, after = 18) => {
-    const lines = pdf.splitTextToSize(text, width) as string[]
-    lines.forEach((line) => {
-      pdf.text(line, left, y)
-      y += 18
-    })
-    y += after
+  const templateResponse = await fetch(consentTemplateUrl)
+  if (!templateResponse.ok) {
+    throw new Error('Unable to load the consent template PDF.')
   }
 
-  pdf.setFont('times', 'bold')
-  pdf.setFontSize(16)
-  pdf.text('Parent Consent Form', 297.5, y, { align: 'center' })
+  const templateBytes = await templateResponse.arrayBuffer()
+  const pdfDoc = await PDFDocument.load(templateBytes)
+  const page = pdfDoc.getPage(0)
+  const pageHeight = page.getHeight()
 
-  y += 40
-  pdf.setFont('times', 'normal')
-  pdf.setFontSize(12)
+  const bodyFont = await pdfDoc.embedFont(StandardFonts.TimesRoman)
 
-  addWrapped('To', 2)
-  addWrapped('The Warden', 2)
-  addWrapped(`${formData.bhawan || '________________'} Bhawan`, 2)
-  addWrapped('BITS Pilani, Pilani Campus', 2)
-  addWrapped('Dear Madam/Sir,', 16)
+  const maskField = (x: number, yMax: number, width: number, height = 14) => {
+    page.drawRectangle({
+      x,
+      y: pageHeight - yMax - 1,
+      width,
+      height,
+      color: rgb(1, 1, 1),
+    })
+  }
 
-  addWrapped(
-    `I, ${formData.parentRelation} of ${formData.childName || '____________________'} bearing ID Number ${formData.idNumber || '____________________'},`,
-    0,
-  )
+  const fitTextToWidth = (value: string, maxWidth: number, size: number) => {
+    const text = normalizeText(value)
+    if (!text) return ''
+    if (bodyFont.widthOfTextAtSize(text, size) <= maxWidth) {
+      return text
+    }
 
-  addWrapped(
-    `am aware of my child applying for leave from ${formatDate(formData.leaveFrom) || '____________'} to ${formatDate(formData.leaveTo) || '____________'}.`,
-    0,
-  )
+    const suffix = '...'
+    let clipped = text
+    while (clipped.length > 0) {
+      const next = `${clipped}${suffix}`
+      if (bodyFont.widthOfTextAtSize(next, size) <= maxWidth) {
+        return next
+      }
+      clipped = clipped.slice(0, -1)
+    }
 
-  addWrapped('Kindly grant her/him leave for the above-mentioned time period.', 0)
-  addWrapped(
-    'I understand that this leave is granted with the assumption that my child is solely responsible for all',
-    0,
-  )
-  addWrapped(
-    'the academic assignments of the respective courses that s/he is currently enrolled in.',
-    12,
-  )
-  addWrapped('Thanking You,', 16)
+    return ''
+  }
 
-  const signatureBoxWidth = 170
-  const signatureBoxHeight = 52
+  const drawTextOnLine = (
+    value: string,
+    x: number,
+    yMax: number,
+    maxWidth: number,
+    size = 12,
+    mask = false,
+    underline = false,
+  ) => {
+    if (mask) {
+      maskField(x, yMax, maxWidth)
+    }
+
+    if (underline) {
+      const baselineY = pageHeight - yMax + 1.2
+      page.drawLine({
+        start: { x, y: baselineY - 2 },
+        end: { x: x + maxWidth, y: baselineY - 2 },
+        thickness: 0.5,
+        color: rgb(0, 0, 0),
+      })
+    }
+
+    const text = fitTextToWidth(value, maxWidth, size)
+    if (!text) return
+
+    page.drawText(text, {
+      x,
+      y: pageHeight - yMax + 1.2,
+      size,
+      font: bodyFont,
+      color: rgb(0, 0, 0),
+    })
+  }
+
+  drawTextOnLine(formData.bhawan, 56.8, 169.301, 77.5, 12, true, true)
+  drawTextOnLine(formData.parentRelation, 66.796, 255.701, 64.95, 12, true)
+  drawTextOnLine(formData.childName, 147.916, 255.701, 180, 12, true, true)
+  drawTextOnLine(formData.idNumber, 427.576, 255.701, 111, 12, true, true)
+  drawTextOnLine(formatDate(formData.leaveFrom), 289.216, 277.301, 108, 12, true, true)
+  drawTextOnLine(formatDate(formData.leaveTo), 415.06, 277.301, 123, 12, true, true)
+
+  drawTextOnLine(formData.fullName, 116.5, 471.701, 290, 12)
+  drawTextOnLine(formData.place, 90, 493.301, 312, 12)
+  drawTextOnLine(formatDate(formData.date), 441, 493.301, 95, 12)
+  drawTextOnLine(formData.mobileNumber, 140, 514.901, 260, 12)
 
   if (formData.signatureImageDataUrl) {
+    const signatureArea = {
+      x: 56.8,
+      yTop: 385.4,
+      width: 138,
+      height: 40,
+    }
+
     const fit = fitWithin(
       formData.signatureImageWidth,
       formData.signatureImageHeight,
-      signatureBoxWidth,
-      signatureBoxHeight,
+      signatureArea.width,
+      signatureArea.height,
     )
 
-    const imageY = y
-    const imageType = formData.signatureImageMimeType.includes('png') ? 'PNG' : 'JPEG'
+    const data = dataUrlToUint8Array(formData.signatureImageDataUrl)
+    const image = formData.signatureImageMimeType.includes('png')
+      ? await pdfDoc.embedPng(data)
+      : await pdfDoc.embedJpg(data)
 
-    pdf.addImage(
-      formData.signatureImageDataUrl,
-      imageType,
-      left,
-      imageY,
-      fit.width,
-      fit.height,
-      undefined,
-      'FAST',
-    )
-
-    y += signatureBoxHeight + 4
+    page.drawImage(image, {
+      x: signatureArea.x + (signatureArea.width - fit.width) / 2,
+      y:
+        pageHeight -
+        signatureArea.yTop -
+        fit.height -
+        (signatureArea.height - fit.height) / 2,
+      width: fit.width,
+      height: fit.height,
+    })
   } else {
-    addWrapped(formData.signatureName || formData.fullName || '___________________________', 2)
+    drawTextOnLine(
+      formData.signatureName || formData.fullName,
+      56.8,
+      428.501,
+      138,
+      11.5,
+      true,
+      true,
+    )
   }
 
-  addWrapped('(Signature)', 12)
-  addWrapped(`Full Name: ${formData.fullName || '___________________________'}`, 0)
-  addWrapped(
-    `Place: ${formData.place || '________________'}                                  Date: ${formatDate(formData.date) || '____________'}`,
-    0,
-  )
-  addWrapped(`Mobile Number: ${formData.mobileNumber || '________________________'}`, 0)
-
-  return pdf.output('blob')
+  const bytes = await pdfDoc.save()
+  const outputBytes = Uint8Array.from(bytes)
+  return new Blob([outputBytes], { type: 'application/pdf' })
 }
 
 function App() {
@@ -841,21 +888,18 @@ function App() {
         <section className="preview">
           <div className="preview-head">
             <h2>Output</h2>
-            <a href={consentTemplateUrl} target="_blank" rel="noreferrer">
-              Open original PDF
-            </a>
           </div>
 
           {generatedDocxUrl || generatedPdfUrl ? (
             <div className="downloads">
               {generatedDocxUrl ? (
-                <a className="download-link" href={generatedDocxUrl} download="filled-consent-form.docx">
-                  Download filled-consent-form.docx
+                <a className="download-link" href={generatedDocxUrl} download={`${normalizeText(formData.idNumber) || 'consent-form'}.docx`}>
+                  Download {normalizeText(formData.idNumber) || 'consent-form'}.docx
                 </a>
               ) : null}
               {generatedPdfUrl ? (
-                <a className="download-link" href={generatedPdfUrl} download="filled-consent-form.pdf">
-                  Download filled-consent-form.pdf
+                <a className="download-link" href={generatedPdfUrl} download={`${normalizeText(formData.idNumber) || 'consent-form'}.pdf`}>
+                  Download {normalizeText(formData.idNumber) || 'consent-form'}.pdf
                 </a>
               ) : null}
             </div>
