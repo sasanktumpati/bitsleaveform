@@ -1,14 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import {
-  AlignmentType,
-  Document,
-  Packer,
-  Paragraph,
-  TabStopType,
-  TextRun,
-  UnderlineType,
-} from 'docx'
-import { jsPDF } from 'jspdf'
 import './App.css'
 import consentTemplateUrl from '../consentform.pdf?url'
 
@@ -22,6 +12,10 @@ type FormState = {
   leaveFrom: string
   leaveTo: string
   signatureName: string
+  signatureImageDataUrl: string
+  signatureImageMimeType: string
+  signatureImageWidth: number
+  signatureImageHeight: number
   fullName: string
   place: string
   date: string
@@ -29,6 +23,18 @@ type FormState = {
 }
 
 type StoredProfiles = Record<string, FormState>
+
+type FittedDimensions = {
+  width: number
+  height: number
+}
+
+type DocSignatureImage = {
+  data: Uint8Array
+  type: 'png' | 'jpg'
+  width: number
+  height: number
+}
 
 const STORAGE_KEY = 'bits-consent-profiles-v1'
 
@@ -40,6 +46,10 @@ const createInitialFormState = (): FormState => ({
   leaveFrom: '',
   leaveTo: '',
   signatureName: '',
+  signatureImageDataUrl: '',
+  signatureImageMimeType: '',
+  signatureImageWidth: 0,
+  signatureImageHeight: 0,
   fullName: '',
   place: '',
   date: new Date().toISOString().slice(0, 10),
@@ -57,16 +67,40 @@ const formatDate = (isoDate: string): string => {
   return `${day}/${month}/${year}`
 }
 
-const underlinedFieldRun = (value: string, minLength: number) => {
-  const normalized = normalizeText(value)
-  const text = normalized.padEnd(Math.max(minLength, normalized.length + 2), ' ')
+const fitWithin = (
+  sourceWidth: number,
+  sourceHeight: number,
+  maxWidth: number,
+  maxHeight: number,
+): FittedDimensions => {
+  if (!sourceWidth || !sourceHeight) {
+    return { width: maxWidth, height: maxHeight }
+  }
 
-  return new TextRun({
-    text,
-    underline: {
-      type: UnderlineType.SINGLE,
-    },
-  })
+  const scale = Math.min(maxWidth / sourceWidth, maxHeight / sourceHeight, 1)
+
+  return {
+    width: Math.max(1, Math.round(sourceWidth * scale)),
+    height: Math.max(1, Math.round(sourceHeight * scale)),
+  }
+}
+
+const normalizeProfile = (input: Partial<FormState>): FormState => {
+  const base = createInitialFormState()
+
+  return {
+    ...base,
+    ...input,
+    parentRelation: input.parentRelation === 'mother' ? 'mother' : 'father',
+    signatureImageDataUrl:
+      typeof input.signatureImageDataUrl === 'string' ? input.signatureImageDataUrl : '',
+    signatureImageMimeType:
+      typeof input.signatureImageMimeType === 'string' ? input.signatureImageMimeType : '',
+    signatureImageWidth:
+      typeof input.signatureImageWidth === 'number' ? input.signatureImageWidth : 0,
+    signatureImageHeight:
+      typeof input.signatureImageHeight === 'number' ? input.signatureImageHeight : 0,
+  }
 }
 
 const loadProfilesFromLocalStorage = (): StoredProfiles => {
@@ -76,19 +110,84 @@ const loadProfilesFromLocalStorage = (): StoredProfiles => {
   if (!raw) return {}
 
   try {
-    const parsed = JSON.parse(raw) as StoredProfiles
-    if (parsed && typeof parsed === 'object') {
-      return parsed
+    const parsed = JSON.parse(raw) as Record<string, Partial<FormState>>
+    if (!parsed || typeof parsed !== 'object') {
+      return {}
     }
+
+    return Object.fromEntries(
+      Object.entries(parsed).map(([id, profile]) => [id, normalizeProfile(profile)]),
+    )
   } catch {
     return {}
   }
-
-  return {}
 }
 
-const buildDocxDocument = (formData: FormState) =>
-  new Document({
+const readFileAsDataUrl = (file: File): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader()
+
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result)
+      } else {
+        reject(new Error('Failed to read signature image.'))
+      }
+    }
+
+    reader.onerror = () => reject(new Error('Failed to read signature image.'))
+    reader.readAsDataURL(file)
+  })
+
+const getImageDimensions = (dataUrl: string): Promise<FittedDimensions> =>
+  new Promise((resolve, reject) => {
+    const image = new Image()
+
+    image.onload = () => {
+      resolve({ width: image.naturalWidth, height: image.naturalHeight })
+    }
+
+    image.onerror = () => reject(new Error('Invalid image file.'))
+    image.src = dataUrl
+  })
+
+const dataUrlToUint8Array = (dataUrl: string): Uint8Array => {
+  const [, encodedPart = ''] = dataUrl.split(',')
+  const binary = atob(encodedPart)
+  const bytes = new Uint8Array(binary.length)
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index)
+  }
+
+  return bytes
+}
+
+const buildDocxDocument = async (formData: FormState, signatureImage: DocSignatureImage | null) => {
+  const {
+    AlignmentType,
+    Document,
+    ImageRun,
+    Packer,
+    Paragraph,
+    TabStopType,
+    TextRun,
+    UnderlineType,
+  } = await import('docx')
+
+  const underlinedFieldRun = (value: string, minLength: number) => {
+    const normalized = normalizeText(value)
+    const text = normalized.padEnd(Math.max(minLength, normalized.length + 2), ' ')
+
+    return new TextRun({
+      text,
+      underline: {
+        type: UnderlineType.SINGLE,
+      },
+    })
+  }
+
+  const document = new Document({
     sections: [
       {
         properties: {
@@ -160,10 +259,24 @@ const buildDocxDocument = (formData: FormState) =>
             spacing: { after: 160 },
           }),
           new Paragraph({ text: 'Thanking You,', spacing: { after: 560 } }),
-          new Paragraph({
-            spacing: { after: 100 },
-            children: [underlinedFieldRun(formData.signatureName || formData.fullName, 24)],
-          }),
+          signatureImage
+            ? new Paragraph({
+                spacing: { after: 100 },
+                children: [
+                  new ImageRun({
+                    type: signatureImage.type,
+                    data: signatureImage.data,
+                    transformation: {
+                      width: signatureImage.width,
+                      height: signatureImage.height,
+                    },
+                  }),
+                ],
+              })
+            : new Paragraph({
+                spacing: { after: 100 },
+                children: [underlinedFieldRun(formData.signatureName || formData.fullName, 24)],
+              }),
           new Paragraph({ text: '(Signature)', spacing: { after: 220 } }),
           new Paragraph({
             spacing: { after: 140 },
@@ -191,7 +304,11 @@ const buildDocxDocument = (formData: FormState) =>
     ],
   })
 
-const buildPdfBlob = (formData: FormState): Blob => {
+  return { document, Packer }
+}
+
+const buildPdfBlob = async (formData: FormState): Promise<Blob> => {
+  const { jsPDF } = await import('jspdf')
   const pdf = new jsPDF({ unit: 'pt', format: 'a4' })
   const left = 56
   const width = 483
@@ -235,10 +352,42 @@ const buildPdfBlob = (formData: FormState): Blob => {
     'I understand that this leave is granted with the assumption that my child is solely responsible for all',
     0,
   )
-  addWrapped('the academic assignments of the respective courses that s/he is currently enrolled in.', 12)
-  addWrapped('Thanking You,', 42)
+  addWrapped(
+    'the academic assignments of the respective courses that s/he is currently enrolled in.',
+    12,
+  )
+  addWrapped('Thanking You,', 16)
 
-  addWrapped(formData.signatureName || formData.fullName || '___________________________', 2)
+  const signatureBoxWidth = 170
+  const signatureBoxHeight = 52
+
+  if (formData.signatureImageDataUrl) {
+    const fit = fitWithin(
+      formData.signatureImageWidth,
+      formData.signatureImageHeight,
+      signatureBoxWidth,
+      signatureBoxHeight,
+    )
+
+    const imageY = y
+    const imageType = formData.signatureImageMimeType.includes('png') ? 'PNG' : 'JPEG'
+
+    pdf.addImage(
+      formData.signatureImageDataUrl,
+      imageType,
+      left,
+      imageY,
+      fit.width,
+      fit.height,
+      undefined,
+      'FAST',
+    )
+
+    y += signatureBoxHeight + 4
+  } else {
+    addWrapped(formData.signatureName || formData.fullName || '___________________________', 2)
+  }
+
   addWrapped('(Signature)', 12)
   addWrapped(`Full Name: ${formData.fullName || '___________________________'}`, 0)
   addWrapped(
@@ -284,7 +433,7 @@ function App() {
       formData.idNumber,
       formData.leaveFrom,
       formData.leaveTo,
-      formData.signatureName,
+      formData.signatureName || formData.signatureImageDataUrl,
       formData.fullName,
       formData.place,
       formData.date,
@@ -298,28 +447,82 @@ function App() {
     setFormData((current) => ({ ...current, [key]: value }))
   }
 
-  const saveCurrentPerson = (): boolean => {
-    const personId = normalizeText(formData.idNumber)
+  const clearSignatureImage = () => {
+    setFormData((current) => ({
+      ...current,
+      signatureImageDataUrl: '',
+      signatureImageMimeType: '',
+      signatureImageWidth: 0,
+      signatureImageHeight: 0,
+    }))
+  }
 
-    if (!personId) {
+  const onSignatureUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+
+    if (!['image/png', 'image/jpeg'].includes(file.type)) {
+      setError('Use PNG or JPEG image for signature.')
+      event.target.value = ''
+      return
+    }
+
+    try {
+      const dataUrl = await readFileAsDataUrl(file)
+      const dimensions = await getImageDimensions(dataUrl)
+
+      setFormData((current) => ({
+        ...current,
+        signatureImageDataUrl: dataUrl,
+        signatureImageMimeType: file.type,
+        signatureImageWidth: dimensions.width,
+        signatureImageHeight: dimensions.height,
+      }))
+      setError(null)
+    } catch (uploadError) {
+      setError(
+        uploadError instanceof Error
+          ? uploadError.message
+          : 'Failed to process signature image.',
+      )
+    } finally {
+      event.target.value = ''
+    }
+  }
+
+  const buildValidatedData = (): FormState | null => {
+    if (!formRef.current?.reportValidity()) {
+      return null
+    }
+
+    const normalizedId = normalizeText(formData.idNumber)
+
+    if (!normalizedId) {
       setError('Enter a Student ID Number to save this person.')
-      return false
+      return null
     }
 
-    const normalizedForm = {
+    return {
       ...formData,
-      idNumber: personId,
+      idNumber: normalizedId,
     }
+  }
 
-    setFormData(normalizedForm)
+  const persistProfile = (data: FormState) => {
+    setFormData(data)
     setProfiles((current) => ({
       ...current,
-      [personId]: normalizedForm,
+      [data.idNumber]: data,
     }))
-    setSelectedPersonId(personId)
-    setError(null)
+    setSelectedPersonId(data.idNumber)
+  }
 
-    return true
+  const saveCurrentPerson = () => {
+    const data = buildValidatedData()
+    if (!data) return
+
+    persistProfile(data)
+    setError(null)
   }
 
   const loadSelectedPerson = () => {
@@ -328,23 +531,43 @@ function App() {
       return
     }
 
-    setFormData(profiles[selectedPersonId])
+    setFormData(normalizeProfile(profiles[selectedPersonId]))
     setError(null)
   }
 
-  const ensureValidAndSaved = (): boolean => {
-    if (!formRef.current?.reportValidity()) return false
-    return saveCurrentPerson()
+  const buildDocSignatureImage = (data: FormState): DocSignatureImage | null => {
+    if (!data.signatureImageDataUrl) {
+      return null
+    }
+
+    const fit = fitWithin(
+      data.signatureImageWidth,
+      data.signatureImageHeight,
+      220,
+      70,
+    )
+
+    return {
+      data: dataUrlToUint8Array(data.signatureImageDataUrl),
+      type: data.signatureImageMimeType.includes('png') ? 'png' : 'jpg',
+      width: fit.width,
+      height: fit.height,
+    }
   }
 
   const generateDocx = async () => {
-    if (!ensureValidAndSaved()) return
+    const data = buildValidatedData()
+    if (!data) return
 
     setIsGenerating(true)
     setError(null)
 
     try {
-      const document = buildDocxDocument(formData)
+      persistProfile(data)
+      const { document, Packer } = await buildDocxDocument(
+        data,
+        buildDocSignatureImage(data),
+      )
       const blob = await Packer.toBlob(document)
       const nextUrl = URL.createObjectURL(blob)
 
@@ -364,13 +587,15 @@ function App() {
   }
 
   const generatePdf = async () => {
-    if (!ensureValidAndSaved()) return
+    const data = buildValidatedData()
+    if (!data) return
 
     setIsGenerating(true)
     setError(null)
 
     try {
-      const blob = buildPdfBlob(formData)
+      persistProfile(data)
+      const blob = await buildPdfBlob(data)
       const nextUrl = URL.createObjectURL(blob)
 
       setGeneratedPdfUrl((currentUrl) => {
@@ -402,7 +627,8 @@ function App() {
           <p className="badge">BITS Pilani</p>
           <h1>Parent Consent Form Assistant</h1>
           <p>
-            Fill once, save person details in this browser, and export as DOCX or PDF.
+            Fill once, save person details in this browser, upload a signature image,
+            and export as DOCX or PDF.
           </p>
         </header>
 
@@ -436,7 +662,7 @@ function App() {
             </div>
           </label>
           <p className="helper-note">
-            Profiles are saved to your browser localStorage on this device.
+            Profiles (including signature image) are saved in browser localStorage.
           </p>
         </section>
 
@@ -511,7 +737,7 @@ function App() {
             Signature Text
             <input
               type="text"
-              placeholder="Name or initials"
+              placeholder="Used if no image is uploaded"
               value={formData.signatureName}
               onChange={(event) => onValueChange('signatureName', event.target.value)}
             />
@@ -527,6 +753,33 @@ function App() {
               required
             />
           </label>
+
+          <label className="span-2">
+            Signature Image (PNG/JPEG)
+            <input
+              type="file"
+              accept="image/png,image/jpeg"
+              onChange={onSignatureUpload}
+            />
+          </label>
+
+          {formData.signatureImageDataUrl ? (
+            <div className="signature-preview span-2">
+              <img src={formData.signatureImageDataUrl} alt="Uploaded signature" />
+              <div className="signature-meta">
+                <span>
+                  {formData.signatureImageWidth} x {formData.signatureImageHeight}px
+                </span>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={clearSignatureImage}
+                >
+                  Remove Image
+                </button>
+              </div>
+            </div>
+          ) : null}
 
           <label>
             Place
@@ -564,10 +817,20 @@ function App() {
             <button type="button" className="ghost" onClick={resetForm}>
               Reset
             </button>
-            <button type="button" className="primary" disabled={isGenerating} onClick={generateDocx}>
+            <button
+              type="button"
+              className="primary"
+              disabled={isGenerating}
+              onClick={generateDocx}
+            >
               {isGenerating ? 'Working...' : 'Generate DOCX'}
             </button>
-            <button type="button" className="primary" disabled={isGenerating} onClick={generatePdf}>
+            <button
+              type="button"
+              className="primary"
+              disabled={isGenerating}
+              onClick={generatePdf}
+            >
               {isGenerating ? 'Working...' : 'Export PDF'}
             </button>
           </div>
