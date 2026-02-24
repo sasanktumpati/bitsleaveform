@@ -31,7 +31,7 @@
   border: 1px solid var(--border);
   border-radius: 16px;
   padding: clamp(1.25rem, 3.5vw, 2.5rem);
-  animation: enter 0.4s ease both;
+
 }
 
 /* ── Header ── */
@@ -333,19 +333,6 @@ button.ghost:hover:not(:disabled) {
 button.small {
   padding: 0.35rem 0.6rem;
   font-size: 0.78rem;
-}
-
-/* ── Animation ── */
-
-@keyframes enter {
-  from {
-    opacity: 0;
-    transform: translateY(12px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
 }
 
 /* ── Responsive ── */
