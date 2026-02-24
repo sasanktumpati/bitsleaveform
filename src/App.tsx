@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback } from 'react'
+import { useRef, useState, useCallback, useEffect } from 'react'
 import './App.css'
 import consentTemplateUrl from '../consentform.pdf?url'
 
@@ -45,23 +45,54 @@ const addDays = (iso: string, days: number): string => {
 const daysBetween = (from: string, to: string): number =>
   Math.round((new Date(to).getTime() - new Date(from).getTime()) / 86400000)
 
-const createInitialFormState = (): FormState => ({
-  bhawan: '',
-  parentRelation: 'father',
-  childName: '',
-  idNumber: '',
-  leaveFrom: new Date().toISOString().slice(0, 10),
-  leaveTo: '',
-  signatureName: '',
-  signatureImageDataUrl: '',
-  signatureImageMimeType: '',
-  signatureImageWidth: 0,
-  signatureImageHeight: 0,
-  fullName: '',
-  place: '',
-  date: new Date().toISOString().slice(0, 10),
-  mobileNumber: '',
-})
+const STORAGE_KEY = 'bits-leave-form'
+
+const SAVED_FIELDS: (keyof FormState)[] = [
+  'bhawan', 'parentRelation', 'childName', 'idNumber',
+  'signatureName', 'signatureImageDataUrl', 'signatureImageMimeType',
+  'signatureImageWidth', 'signatureImageHeight',
+  'fullName', 'place', 'mobileNumber',
+]
+
+const createInitialFormState = (): FormState => {
+  const base: FormState = {
+    bhawan: '',
+    parentRelation: 'father',
+    childName: '',
+    idNumber: '',
+    leaveFrom: new Date().toISOString().slice(0, 10),
+    leaveTo: '',
+    signatureName: '',
+    signatureImageDataUrl: '',
+    signatureImageMimeType: '',
+    signatureImageWidth: 0,
+    signatureImageHeight: 0,
+    fullName: '',
+    place: '',
+    date: new Date().toISOString().slice(0, 10),
+    mobileNumber: '',
+  }
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw) {
+      const saved = JSON.parse(raw)
+      for (const key of SAVED_FIELDS) {
+        if (saved[key] !== undefined) {
+          ;(base as Record<string, unknown>)[key] = saved[key]
+        }
+      }
+    }
+  } catch { /* ignore */ }
+  return base
+}
+
+const saveFormData = (data: FormState) => {
+  try {
+    const toSave: Record<string, unknown> = {}
+    for (const key of SAVED_FIELDS) toSave[key] = data[key]
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave))
+  } catch { /* ignore */ }
+}
 
 const normalizeText = (value: string): string => value.replace(/\s+/g, ' ').trim()
 
@@ -383,6 +414,8 @@ function App() {
   const dragging = useRef(false)
   const dragStart = useRef<{ x: number; y: number } | null>(null)
 
+  useEffect(() => { saveFormData(formData) }, [formData])
+
   const set = (key: keyof FormState, value: string) =>
     setFormData((s) => ({ ...s, [key]: value }))
 
@@ -582,7 +615,14 @@ function App() {
   }
 
   const reset = () => {
-    setFormData(createInitialFormState())
+    try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
+    setFormData({
+      ...createInitialFormState(),
+      bhawan: '', parentRelation: 'father', childName: '', idNumber: '',
+      signatureName: '', signatureImageDataUrl: '', signatureImageMimeType: '',
+      signatureImageWidth: 0, signatureImageHeight: 0,
+      fullName: '', place: '', mobileNumber: '',
+    })
     setDuration('')
     setCropSource(null)
     setCropRect(null)
