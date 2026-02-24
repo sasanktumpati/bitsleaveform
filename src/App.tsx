@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useRef, useState, useCallback } from 'react'
 import './App.css'
 import consentTemplateUrl from '../consentform.pdf?url'
 
@@ -22,7 +22,7 @@ type FormState = {
   mobileNumber: string
 }
 
-type StoredProfiles = Record<string, FormState>
+type CropRect = { x: number; y: number; w: number; h: number }
 
 type FittedDimensions = {
   width: number
@@ -36,14 +36,21 @@ type DocSignatureImage = {
   height: number
 }
 
-const STORAGE_KEY = 'bits-consent-profiles-v1'
+const addDays = (iso: string, days: number): string => {
+  const d = new Date(iso)
+  d.setDate(d.getDate() + days)
+  return d.toISOString().slice(0, 10)
+}
+
+const daysBetween = (from: string, to: string): number =>
+  Math.round((new Date(to).getTime() - new Date(from).getTime()) / 86400000)
 
 const createInitialFormState = (): FormState => ({
   bhawan: '',
   parentRelation: 'father',
   childName: '',
   idNumber: '',
-  leaveFrom: '',
+  leaveFrom: new Date().toISOString().slice(0, 10),
   leaveTo: '',
   signatureName: '',
   signatureImageDataUrl: '',
@@ -60,10 +67,8 @@ const normalizeText = (value: string): string => value.replace(/\s+/g, ' ').trim
 
 const formatDate = (isoDate: string): string => {
   if (!isoDate) return ''
-
   const [year, month, day] = isoDate.split('-')
   if (!year || !month || !day) return isoDate
-
   return `${day}/${month}/${year}`
 }
 
@@ -76,65 +81,20 @@ const fitWithin = (
   if (!sourceWidth || !sourceHeight) {
     return { width: maxWidth, height: maxHeight }
   }
-
   const scale = Math.min(maxWidth / sourceWidth, maxHeight / sourceHeight, 1)
-
   return {
     width: Math.max(1, Math.round(sourceWidth * scale)),
     height: Math.max(1, Math.round(sourceHeight * scale)),
   }
 }
 
-const normalizeProfile = (input: Partial<FormState>): FormState => {
-  const base = createInitialFormState()
-
-  return {
-    ...base,
-    ...input,
-    parentRelation: input.parentRelation === 'mother' ? 'mother' : 'father',
-    signatureImageDataUrl:
-      typeof input.signatureImageDataUrl === 'string' ? input.signatureImageDataUrl : '',
-    signatureImageMimeType:
-      typeof input.signatureImageMimeType === 'string' ? input.signatureImageMimeType : '',
-    signatureImageWidth:
-      typeof input.signatureImageWidth === 'number' ? input.signatureImageWidth : 0,
-    signatureImageHeight:
-      typeof input.signatureImageHeight === 'number' ? input.signatureImageHeight : 0,
-  }
-}
-
-const loadProfilesFromLocalStorage = (): StoredProfiles => {
-  if (typeof window === 'undefined') return {}
-
-  const raw = window.localStorage.getItem(STORAGE_KEY)
-  if (!raw) return {}
-
-  try {
-    const parsed = JSON.parse(raw) as Record<string, Partial<FormState>>
-    if (!parsed || typeof parsed !== 'object') {
-      return {}
-    }
-
-    return Object.fromEntries(
-      Object.entries(parsed).map(([id, profile]) => [id, normalizeProfile(profile)]),
-    )
-  } catch {
-    return {}
-  }
-}
-
 const readFileAsDataUrl = (file: File): Promise<string> =>
   new Promise((resolve, reject) => {
     const reader = new FileReader()
-
     reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        resolve(reader.result)
-      } else {
-        reject(new Error('Failed to read signature image.'))
-      }
+      if (typeof reader.result === 'string') resolve(reader.result)
+      else reject(new Error('Failed to read signature image.'))
     }
-
     reader.onerror = () => reject(new Error('Failed to read signature image.'))
     reader.readAsDataURL(file)
   })
@@ -142,11 +102,8 @@ const readFileAsDataUrl = (file: File): Promise<string> =>
 const getImageDimensions = (dataUrl: string): Promise<FittedDimensions> =>
   new Promise((resolve, reject) => {
     const image = new Image()
-
-    image.onload = () => {
+    image.onload = () =>
       resolve({ width: image.naturalWidth, height: image.naturalHeight })
-    }
-
     image.onerror = () => reject(new Error('Invalid image file.'))
     image.src = dataUrl
   })
@@ -155,15 +112,27 @@ const dataUrlToUint8Array = (dataUrl: string): Uint8Array => {
   const [, encodedPart = ''] = dataUrl.split(',')
   const binary = atob(encodedPart)
   const bytes = new Uint8Array(binary.length)
-
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index)
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i)
   }
-
   return bytes
 }
 
-const buildDocxDocument = async (formData: FormState, signatureImage: DocSignatureImage | null) => {
+const triggerDownload = (blob: Blob, filename: string) => {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+const buildDocxDocument = async (
+  formData: FormState,
+  signatureImage: DocSignatureImage | null,
+) => {
   const {
     AlignmentType,
     Document,
@@ -178,13 +147,7 @@ const buildDocxDocument = async (formData: FormState, signatureImage: DocSignatu
   const underlinedFieldRun = (value: string, minLength: number) => {
     const normalized = normalizeText(value)
     const text = normalized.padEnd(Math.max(minLength, normalized.length + 2), ' ')
-
-    return new TextRun({
-      text,
-      underline: {
-        type: UnderlineType.SINGLE,
-      },
-    })
+    return new TextRun({ text, underline: { type: UnderlineType.SINGLE } })
   }
 
   const document = new Document({
@@ -192,29 +155,15 @@ const buildDocxDocument = async (formData: FormState, signatureImage: DocSignatu
       {
         properties: {
           page: {
-            size: {
-              width: 11906,
-              height: 16838,
-            },
-            margin: {
-              top: 1440,
-              right: 1440,
-              bottom: 1440,
-              left: 1440,
-            },
+            size: { width: 11906, height: 16838 },
+            margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
           },
         },
         children: [
           new Paragraph({
             alignment: AlignmentType.CENTER,
             spacing: { after: 380 },
-            children: [
-              new TextRun({
-                text: 'Parent Consent Form',
-                bold: true,
-                size: 30,
-              }),
-            ],
+            children: [new TextRun({ text: 'Parent Consent Form', bold: true, size: 30 })],
           }),
           new Paragraph({ text: 'To', spacing: { after: 120 } }),
           new Paragraph({ text: 'The Warden', spacing: { after: 120 } }),
@@ -275,7 +224,9 @@ const buildDocxDocument = async (formData: FormState, signatureImage: DocSignatu
               })
             : new Paragraph({
                 spacing: { after: 100 },
-                children: [underlinedFieldRun(formData.signatureName || formData.fullName, 24)],
+                children: [
+                  underlinedFieldRun(formData.signatureName || formData.fullName, 24),
+                ],
               }),
           new Paragraph({ text: '(Signature)', spacing: { after: 220 } }),
           new Paragraph({
@@ -311,15 +262,12 @@ const buildPdfBlob = async (formData: FormState): Promise<Blob> => {
   const { PDFDocument, StandardFonts, rgb } = await import('pdf-lib')
 
   const templateResponse = await fetch(consentTemplateUrl)
-  if (!templateResponse.ok) {
-    throw new Error('Unable to load the consent template PDF.')
-  }
+  if (!templateResponse.ok) throw new Error('Unable to load the consent template PDF.')
 
   const templateBytes = await templateResponse.arrayBuffer()
   const pdfDoc = await PDFDocument.load(templateBytes)
   const page = pdfDoc.getPage(0)
   const pageHeight = page.getHeight()
-
   const bodyFont = await pdfDoc.embedFont(StandardFonts.TimesRoman)
 
   const maskField = (x: number, yMax: number, width: number, height = 14) => {
@@ -335,20 +283,13 @@ const buildPdfBlob = async (formData: FormState): Promise<Blob> => {
   const fitTextToWidth = (value: string, maxWidth: number, size: number) => {
     const text = normalizeText(value)
     if (!text) return ''
-    if (bodyFont.widthOfTextAtSize(text, size) <= maxWidth) {
-      return text
-    }
-
-    const suffix = '...'
+    if (bodyFont.widthOfTextAtSize(text, size) <= maxWidth) return text
     let clipped = text
     while (clipped.length > 0) {
-      const next = `${clipped}${suffix}`
-      if (bodyFont.widthOfTextAtSize(next, size) <= maxWidth) {
-        return next
-      }
+      const next = `${clipped}...`
+      if (bodyFont.widthOfTextAtSize(next, size) <= maxWidth) return next
       clipped = clipped.slice(0, -1)
     }
-
     return ''
   }
 
@@ -361,10 +302,7 @@ const buildPdfBlob = async (formData: FormState): Promise<Blob> => {
     mask = false,
     underline = false,
   ) => {
-    if (mask) {
-      maskField(x, yMax, maxWidth)
-    }
-
+    if (mask) maskField(x, yMax, maxWidth)
     if (underline) {
       const baselineY = pageHeight - yMax + 1.2
       page.drawLine({
@@ -374,10 +312,8 @@ const buildPdfBlob = async (formData: FormState): Promise<Blob> => {
         color: rgb(0, 0, 0),
       })
     }
-
     const text = fitTextToWidth(value, maxWidth, size)
     if (!text) return
-
     page.drawText(text, {
       x,
       y: pageHeight - yMax + 1.2,
@@ -393,39 +329,26 @@ const buildPdfBlob = async (formData: FormState): Promise<Blob> => {
   drawTextOnLine(formData.idNumber, 427.576, 255.701, 111, 12, true, true)
   drawTextOnLine(formatDate(formData.leaveFrom), 289.216, 277.301, 108, 12, true, true)
   drawTextOnLine(formatDate(formData.leaveTo), 415.06, 277.301, 123, 12, true, true)
-
   drawTextOnLine(formData.fullName, 116.5, 471.701, 290, 12)
   drawTextOnLine(formData.place, 90, 493.301, 312, 12)
   drawTextOnLine(formatDate(formData.date), 441, 493.301, 95, 12)
   drawTextOnLine(formData.mobileNumber, 140, 514.901, 260, 12)
 
   if (formData.signatureImageDataUrl) {
-    const signatureArea = {
-      x: 56.8,
-      yTop: 385.4,
-      width: 138,
-      height: 40,
-    }
-
+    const area = { x: 56.8, yTop: 385.4, width: 138, height: 40 }
     const fit = fitWithin(
       formData.signatureImageWidth,
       formData.signatureImageHeight,
-      signatureArea.width,
-      signatureArea.height,
+      area.width,
+      area.height,
     )
-
     const data = dataUrlToUint8Array(formData.signatureImageDataUrl)
     const image = formData.signatureImageMimeType.includes('png')
       ? await pdfDoc.embedPng(data)
       : await pdfDoc.embedJpg(data)
-
     page.drawImage(image, {
-      x: signatureArea.x + (signatureArea.width - fit.width) / 2,
-      y:
-        pageHeight -
-        signatureArea.yTop -
-        fit.height -
-        (signatureArea.height - fit.height) / 2,
+      x: area.x + (area.width - fit.width) / 2,
+      y: pageHeight - area.yTop - fit.height - (area.height - fit.height) / 2,
       width: fit.width,
       height: fit.height,
     })
@@ -442,472 +365,480 @@ const buildPdfBlob = async (formData: FormState): Promise<Blob> => {
   }
 
   const bytes = await pdfDoc.save()
-  const outputBytes = Uint8Array.from(bytes)
-  return new Blob([outputBytes], { type: 'application/pdf' })
+  return new Blob([Uint8Array.from(bytes)], { type: 'application/pdf' })
 }
 
 function App() {
   const formRef = useRef<HTMLFormElement | null>(null)
-
   const [formData, setFormData] = useState<FormState>(createInitialFormState)
-  const [profiles, setProfiles] = useState<StoredProfiles>(() => loadProfilesFromLocalStorage())
-  const [selectedPersonId, setSelectedPersonId] = useState('')
-  const [generatedDocxUrl, setGeneratedDocxUrl] = useState<string | null>(null)
-  const [generatedPdfUrl, setGeneratedPdfUrl] = useState<string | null>(null)
+  const [duration, setDuration] = useState<number | ''>('')
   const [isGenerating, setIsGenerating] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(profiles))
-  }, [profiles])
+  // Crop state
+  const [cropSource, setCropSource] = useState<string | null>(null)
+  const [cropRect, setCropRect] = useState<CropRect | null>(null)
+  const cropImgRef = useRef<HTMLImageElement | null>(null)
+  const cropAreaRef = useRef<HTMLDivElement | null>(null)
+  const dragging = useRef(false)
+  const dragStart = useRef<{ x: number; y: number } | null>(null)
 
-  useEffect(() => {
-    return () => {
-      if (generatedDocxUrl) URL.revokeObjectURL(generatedDocxUrl)
-      if (generatedPdfUrl) URL.revokeObjectURL(generatedPdfUrl)
-    }
-  }, [generatedDocxUrl, generatedPdfUrl])
+  const set = (key: keyof FormState, value: string) =>
+    setFormData((s) => ({ ...s, [key]: value }))
 
-  const savedPersonIds = useMemo(
-    () => Object.keys(profiles).sort((first, second) => first.localeCompare(second)),
-    [profiles],
-  )
-
-  const filledFieldsCount = useMemo(() => {
-    const fieldValues = [
-      formData.bhawan,
-      formData.childName,
-      formData.idNumber,
-      formData.leaveFrom,
-      formData.leaveTo,
-      formData.signatureName || formData.signatureImageDataUrl,
-      formData.fullName,
-      formData.place,
-      formData.date,
-      formData.mobileNumber,
-    ]
-
-    return fieldValues.filter((value) => value.trim() !== '').length
-  }, [formData])
-
-  const onValueChange = (key: keyof FormState, value: string) => {
-    setFormData((current) => ({ ...current, [key]: value }))
+  // Leave date handlers
+  const handleLeaveFrom = (value: string) => {
+    setFormData((s) => {
+      const next = { ...s, leaveFrom: value }
+      if (duration !== '' && duration > 0 && value) {
+        next.leaveTo = addDays(value, duration)
+      }
+      return next
+    })
   }
 
-  const clearSignatureImage = () => {
-    setFormData((current) => ({
-      ...current,
+  const handleDuration = (days: number | '') => {
+    setDuration(days)
+    if (days !== '' && days > 0 && formData.leaveFrom) {
+      setFormData((s) => ({ ...s, leaveTo: addDays(s.leaveFrom, days) }))
+    }
+  }
+
+  const handleLeaveTo = (value: string) => {
+    setFormData((s) => ({ ...s, leaveTo: value }))
+    if (value && formData.leaveFrom) {
+      const diff = daysBetween(formData.leaveFrom, value)
+      setDuration(diff > 0 ? diff : '')
+    } else {
+      setDuration('')
+    }
+  }
+
+  const clearSignature = () => {
+    setFormData((s) => ({
+      ...s,
       signatureImageDataUrl: '',
       signatureImageMimeType: '',
       signatureImageWidth: 0,
       signatureImageHeight: 0,
     }))
+    setCropSource(null)
+    setCropRect(null)
   }
 
-  const onSignatureUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
+  const onSignatureUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
     if (!file) return
-
     if (!['image/png', 'image/jpeg'].includes(file.type)) {
-      setError('Use PNG or JPEG image for signature.')
-      event.target.value = ''
+      setError('Use a PNG or JPEG for the signature.')
+      e.target.value = ''
       return
     }
-
     try {
       const dataUrl = await readFileAsDataUrl(file)
-      const dimensions = await getImageDimensions(dataUrl)
-
-      setFormData((current) => ({
-        ...current,
+      const dim = await getImageDimensions(dataUrl)
+      setFormData((s) => ({
+        ...s,
         signatureImageDataUrl: dataUrl,
         signatureImageMimeType: file.type,
-        signatureImageWidth: dimensions.width,
-        signatureImageHeight: dimensions.height,
+        signatureImageWidth: dim.width,
+        signatureImageHeight: dim.height,
       }))
       setError(null)
-    } catch (uploadError) {
-      setError(
-        uploadError instanceof Error
-          ? uploadError.message
-          : 'Failed to process signature image.',
-      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to process image.')
     } finally {
-      event.target.value = ''
+      e.target.value = ''
     }
   }
 
-  const buildValidatedData = (): FormState | null => {
-    if (!formRef.current?.reportValidity()) {
-      return null
-    }
-
-    const normalizedId = normalizeText(formData.idNumber)
-
-    if (!normalizedId) {
-      setError('Enter a Student ID Number to save this person.')
-      return null
-    }
-
-    return {
-      ...formData,
-      idNumber: normalizedId,
+  // Crop handlers
+  const openCrop = () => {
+    if (formData.signatureImageDataUrl) {
+      setCropSource(formData.signatureImageDataUrl)
+      setCropRect(null)
     }
   }
 
-  const persistProfile = (data: FormState) => {
-    setFormData(data)
-    setProfiles((current) => ({
-      ...current,
-      [data.idNumber]: data,
-    }))
-    setSelectedPersonId(data.idNumber)
+  const cancelCrop = () => {
+    setCropSource(null)
+    setCropRect(null)
   }
 
-  const saveCurrentPerson = () => {
-    const data = buildValidatedData()
-    if (!data) return
-
-    persistProfile(data)
-    setError(null)
-  }
-
-  const loadSelectedPerson = () => {
-    if (!selectedPersonId || !profiles[selectedPersonId]) {
-      setError('Select a saved person ID to load details.')
-      return
-    }
-
-    setFormData(normalizeProfile(profiles[selectedPersonId]))
-    setError(null)
-  }
-
-  const buildDocSignatureImage = (data: FormState): DocSignatureImage | null => {
-    if (!data.signatureImageDataUrl) {
-      return null
-    }
-
-    const fit = fitWithin(
-      data.signatureImageWidth,
-      data.signatureImageHeight,
-      220,
-      70,
+  const applyCrop = () => {
+    const img = cropImgRef.current
+    if (!img || !cropRect || cropRect.w < 5 || cropRect.h < 5) return
+    const scaleX = img.naturalWidth / img.clientWidth
+    const scaleY = img.naturalHeight / img.clientHeight
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.round(cropRect.w * scaleX)
+    canvas.height = Math.round(cropRect.h * scaleY)
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.drawImage(
+      img,
+      Math.round(cropRect.x * scaleX),
+      Math.round(cropRect.y * scaleY),
+      canvas.width,
+      canvas.height,
+      0,
+      0,
+      canvas.width,
+      canvas.height,
     )
+    const dataUrl = canvas.toDataURL('image/png')
+    setFormData((s) => ({
+      ...s,
+      signatureImageDataUrl: dataUrl,
+      signatureImageMimeType: 'image/png',
+      signatureImageWidth: canvas.width,
+      signatureImageHeight: canvas.height,
+    }))
+    setCropSource(null)
+    setCropRect(null)
+  }
 
+  const onCropPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const area = cropAreaRef.current
+    if (!area) return
+    area.setPointerCapture(e.pointerId)
+    const rect = area.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    dragStart.current = { x, y }
+    dragging.current = true
+    setCropRect({ x, y, w: 0, h: 0 })
+  }, [])
+
+  const onCropPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragging.current || !dragStart.current) return
+    const area = cropAreaRef.current
+    if (!area) return
+    const rect = area.getBoundingClientRect()
+    const curX = Math.max(0, Math.min(e.clientX - rect.left, rect.width))
+    const curY = Math.max(0, Math.min(e.clientY - rect.top, rect.height))
+    const x = Math.min(dragStart.current.x, curX)
+    const y = Math.min(dragStart.current.y, curY)
+    const w = Math.abs(curX - dragStart.current.x)
+    const h = Math.abs(curY - dragStart.current.y)
+    setCropRect({ x, y, w, h })
+  }, [])
+
+  const onCropPointerUp = useCallback(() => {
+    dragging.current = false
+  }, [])
+
+  const validate = (): FormState | null => {
+    if (!formRef.current?.reportValidity()) return null
+    const id = normalizeText(formData.idNumber)
+    if (!id) {
+      setError('Student ID is required.')
+      return null
+    }
+    return { ...formData, idNumber: id }
+  }
+
+  const filename = (ext: string) =>
+    `${normalizeText(formData.idNumber) || 'consent-form'}.${ext}`
+
+  const buildSigImage = (d: FormState): DocSignatureImage | null => {
+    if (!d.signatureImageDataUrl) return null
+    const fit = fitWithin(d.signatureImageWidth, d.signatureImageHeight, 220, 70)
     return {
-      data: dataUrlToUint8Array(data.signatureImageDataUrl),
-      type: data.signatureImageMimeType.includes('png') ? 'png' : 'jpg',
+      data: dataUrlToUint8Array(d.signatureImageDataUrl),
+      type: d.signatureImageMimeType.includes('png') ? 'png' : 'jpg',
       width: fit.width,
       height: fit.height,
     }
   }
 
-  const generateDocx = async () => {
-    const data = buildValidatedData()
+  const exportDocx = async () => {
+    const data = validate()
     if (!data) return
-
     setIsGenerating(true)
     setError(null)
-
     try {
-      persistProfile(data)
-      const { document, Packer } = await buildDocxDocument(
-        data,
-        buildDocSignatureImage(data),
-      )
-      const blob = await Packer.toBlob(document)
-      const nextUrl = URL.createObjectURL(blob)
-
-      setGeneratedDocxUrl((currentUrl) => {
-        if (currentUrl) URL.revokeObjectURL(currentUrl)
-        return nextUrl
-      })
-    } catch (generationError) {
-      setError(
-        generationError instanceof Error
-          ? generationError.message
-          : 'DOCX generation failed. Please try again.',
-      )
+      const { document, Packer } = await buildDocxDocument(data, buildSigImage(data))
+      triggerDownload(await Packer.toBlob(document), filename('docx'))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'DOCX export failed.')
     } finally {
       setIsGenerating(false)
     }
   }
 
-  const generatePdf = async () => {
-    const data = buildValidatedData()
+  const exportPdf = async () => {
+    const data = validate()
     if (!data) return
-
     setIsGenerating(true)
     setError(null)
-
     try {
-      persistProfile(data)
-      const blob = await buildPdfBlob(data)
-      const nextUrl = URL.createObjectURL(blob)
-
-      setGeneratedPdfUrl((currentUrl) => {
-        if (currentUrl) URL.revokeObjectURL(currentUrl)
-        return nextUrl
-      })
-    } catch (generationError) {
-      setError(
-        generationError instanceof Error
-          ? generationError.message
-          : 'PDF generation failed. Please try again.',
-      )
+      triggerDownload(await buildPdfBlob(data), filename('pdf'))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'PDF export failed.')
     } finally {
       setIsGenerating(false)
     }
   }
 
-  const resetForm = () => {
+  const reset = () => {
     setFormData(createInitialFormState())
+    setDuration('')
+    setCropSource(null)
+    setCropRect(null)
     setError(null)
   }
 
   return (
-    <main className="portal-shell">
-      <div className="ambient-glow" aria-hidden="true" />
-
-      <section className="portal-card">
-        <header className="portal-header">
-          <p className="badge">BITS Pilani</p>
-          <h1>Parent Consent Form Assistant</h1>
-          <p>
-            Fill once, save person details in this browser, upload a signature image,
-            and export as DOCX or PDF.
-          </p>
+    <main className="shell">
+      <div className="card">
+        <header className="header">
+          <span className="campus">BITS Pilani, Pilani Campus</span>
+          <h1>Parent Consent Form</h1>
+          <p>Fill out and export as PDF or DOCX.</p>
         </header>
 
-        <div className="meta-strip">
-          <span>Original reference: consentform.pdf</span>
-          <span>{filledFieldsCount}/10 fields filled</span>
-          <span>{savedPersonIds.length} saved profiles</span>
-        </div>
-
-        <section className="profile-tools">
-          <label>
-            Saved Person (by Student ID)
-            <div className="profile-row">
-              <select
-                value={selectedPersonId}
-                onChange={(event) => setSelectedPersonId(event.target.value)}
-              >
-                <option value="">Select saved ID</option>
-                {savedPersonIds.map((id) => (
-                  <option key={id} value={id}>
-                    {id}
-                  </option>
-                ))}
-              </select>
-              <button type="button" className="ghost" onClick={loadSelectedPerson}>
-                Load
-              </button>
-              <button type="button" className="ghost" onClick={saveCurrentPerson}>
-                Save Current
-              </button>
+        <form ref={formRef} onSubmit={(e) => e.preventDefault()}>
+          {/* ── Student ── */}
+          <div className="form-section">
+            <h2 className="section-title">Student</h2>
+            <div className="fields">
+              <label>
+                Bhawan
+                <input
+                  type="text"
+                  placeholder="e.g. SR"
+                  value={formData.bhawan}
+                  onChange={(e) => set('bhawan', e.target.value)}
+                  required
+                />
+              </label>
+              <label>
+                ID Number
+                <input
+                  type="text"
+                  placeholder="2024A7PS0000P"
+                  value={formData.idNumber}
+                  onChange={(e) => set('idNumber', e.target.value)}
+                  required
+                />
+              </label>
+              <label className="full">
+                Full Name
+                <input
+                  type="text"
+                  placeholder="As per institute records"
+                  value={formData.childName}
+                  onChange={(e) => set('childName', e.target.value)}
+                  required
+                />
+              </label>
             </div>
-          </label>
-          <p className="helper-note">
-            Profiles (including signature image) are saved in browser localStorage.
-          </p>
-        </section>
+          </div>
 
-        <form ref={formRef} className="field-grid">
-          <label>
-            Bhawan
-            <input
-              type="text"
-              placeholder="e.g. SR Bhawan"
-              value={formData.bhawan}
-              onChange={(event) => onValueChange('bhawan', event.target.value)}
-              required
-            />
-          </label>
+          {/* ── Leave Period ── */}
+          <div className="form-section">
+            <h2 className="section-title">Leave Period</h2>
+            <div className="fields cols-3">
+              <label>
+                From
+                <input
+                  type="date"
+                  value={formData.leaveFrom}
+                  onChange={(e) => handleLeaveFrom(e.target.value)}
+                  required
+                />
+              </label>
+              <label>
+                Duration (days)
+                <input
+                  type="number"
+                  min="1"
+                  placeholder="Optional"
+                  value={duration}
+                  onChange={(e) =>
+                    handleDuration(e.target.value === '' ? '' : parseInt(e.target.value, 10))
+                  }
+                />
+              </label>
+              <label>
+                To
+                <input
+                  type="date"
+                  value={formData.leaveTo}
+                  onChange={(e) => handleLeaveTo(e.target.value)}
+                  required
+                />
+              </label>
+            </div>
+          </div>
 
-          <label>
-            Parent Relation
-            <select
-              value={formData.parentRelation}
-              onChange={(event) =>
-                onValueChange('parentRelation', event.target.value as ParentRelation)
-              }
-            >
-              <option value="mother">Mother</option>
-              <option value="father">Father</option>
-            </select>
-          </label>
-
-          <label className="span-2">
-            Student Name
-            <input
-              type="text"
-              placeholder="Child name as per records"
-              value={formData.childName}
-              onChange={(event) => onValueChange('childName', event.target.value)}
-              required
-            />
-          </label>
-
-          <label>
-            Student ID Number
-            <input
-              type="text"
-              placeholder="2024A7PS0000P"
-              value={formData.idNumber}
-              onChange={(event) => onValueChange('idNumber', event.target.value)}
-              required
-            />
-          </label>
-
-          <label>
-            Leave From
-            <input
-              type="date"
-              value={formData.leaveFrom}
-              onChange={(event) => onValueChange('leaveFrom', event.target.value)}
-              required
-            />
-          </label>
-
-          <label>
-            Leave To
-            <input
-              type="date"
-              value={formData.leaveTo}
-              onChange={(event) => onValueChange('leaveTo', event.target.value)}
-              required
-            />
-          </label>
-
-          <label>
-            Signature Text
-            <input
-              type="text"
-              placeholder="Used if no image is uploaded"
-              value={formData.signatureName}
-              onChange={(event) => onValueChange('signatureName', event.target.value)}
-            />
-          </label>
-
-          <label>
-            Full Name
-            <input
-              type="text"
-              placeholder="Parent full name"
-              value={formData.fullName}
-              onChange={(event) => onValueChange('fullName', event.target.value)}
-              required
-            />
-          </label>
-
-          <label className="span-2">
-            Signature Image (PNG/JPEG)
-            <input
-              type="file"
-              accept="image/png,image/jpeg"
-              onChange={onSignatureUpload}
-            />
-          </label>
-
-          {formData.signatureImageDataUrl ? (
-            <div className="signature-preview span-2">
-              <img src={formData.signatureImageDataUrl} alt="Uploaded signature" />
-              <div className="signature-meta">
-                <span>
-                  {formData.signatureImageWidth} x {formData.signatureImageHeight}px
-                </span>
-                <button
-                  type="button"
-                  className="ghost"
-                  onClick={clearSignatureImage}
+          {/* ── Parent / Guardian ── */}
+          <div className="form-section">
+            <h2 className="section-title">Parent / Guardian</h2>
+            <div className="fields">
+              <label>
+                Relation
+                <select
+                  value={formData.parentRelation}
+                  onChange={(e) => set('parentRelation', e.target.value as ParentRelation)}
                 >
-                  Remove Image
-                </button>
-              </div>
+                  <option value="father">Father</option>
+                  <option value="mother">Mother</option>
+                </select>
+              </label>
+              <label>
+                Full Name
+                <input
+                  type="text"
+                  placeholder="Parent's full name"
+                  value={formData.fullName}
+                  onChange={(e) => set('fullName', e.target.value)}
+                  required
+                />
+              </label>
+              <label>
+                Place
+                <input
+                  type="text"
+                  placeholder="City"
+                  value={formData.place}
+                  onChange={(e) => set('place', e.target.value)}
+                  required
+                />
+              </label>
+              <label>
+                Date
+                <input
+                  type="date"
+                  value={formData.date}
+                  onChange={(e) => set('date', e.target.value)}
+                  required
+                />
+              </label>
+              <label className="full">
+                Mobile Number
+                <input
+                  type="tel"
+                  placeholder="10 digit mobile"
+                  value={formData.mobileNumber}
+                  onChange={(e) => set('mobileNumber', e.target.value)}
+                  required
+                />
+              </label>
             </div>
-          ) : null}
+          </div>
 
-          <label>
-            Place
-            <input
-              type="text"
-              placeholder="City"
-              value={formData.place}
-              onChange={(event) => onValueChange('place', event.target.value)}
-              required
-            />
-          </label>
+          {/* ── Signature ── */}
+          <div className="form-section">
+            <h2 className="section-title">Signature</h2>
+            <div className="fields">
+              <label>
+                Text (fallback)
+                <input
+                  type="text"
+                  placeholder="Used when no image is uploaded"
+                  value={formData.signatureName}
+                  onChange={(e) => set('signatureName', e.target.value)}
+                />
+              </label>
+              <label>
+                Upload Image
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg"
+                  onChange={onSignatureUpload}
+                />
+              </label>
+            </div>
 
-          <label>
-            Date
-            <input
-              type="date"
-              value={formData.date}
-              onChange={(event) => onValueChange('date', event.target.value)}
-              required
-            />
-          </label>
+            {cropSource && (
+              <div className="crop-container">
+                <p className="crop-hint">Click and drag to select the area to keep</p>
+                <div
+                  className="crop-workspace"
+                  ref={cropAreaRef}
+                  onPointerDown={onCropPointerDown}
+                  onPointerMove={onCropPointerMove}
+                  onPointerUp={onCropPointerUp}
+                >
+                  <img
+                    ref={cropImgRef}
+                    src={cropSource}
+                    alt="Crop source"
+                    draggable={false}
+                  />
+                  {cropRect && cropRect.w > 0 && cropRect.h > 0 && (
+                    <div
+                      className="crop-selection"
+                      style={{
+                        left: cropRect.x,
+                        top: cropRect.y,
+                        width: cropRect.w,
+                        height: cropRect.h,
+                      }}
+                    />
+                  )}
+                </div>
+                <div className="crop-actions">
+                  <button type="button" className="ghost small" onClick={cancelCrop}>
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="primary small"
+                    onClick={applyCrop}
+                    disabled={!cropRect || cropRect.w < 5 || cropRect.h < 5}
+                  >
+                    Apply Crop
+                  </button>
+                </div>
+              </div>
+            )}
 
-          <label className="span-2">
-            Mobile Number
-            <input
-              type="tel"
-              placeholder="10 digit mobile"
-              value={formData.mobileNumber}
-              onChange={(event) => onValueChange('mobileNumber', event.target.value)}
-              required
-            />
-          </label>
+            {formData.signatureImageDataUrl && !cropSource && (
+              <div className="sig-preview" onClick={openCrop} role="button" tabIndex={0} onKeyDown={(e) => e.key === 'Enter' && openCrop()}>
+                <img src={formData.signatureImageDataUrl} alt="Signature" />
+                <div className="sig-info">
+                  <span>
+                    {formData.signatureImageWidth}&times;{formData.signatureImageHeight}
+                  </span>
+                  <span className="crop-label">Click to crop</span>
+                  <button type="button" className="ghost small" onClick={(e) => { e.stopPropagation(); clearSignature(); }}>
+                    Remove
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
 
-          <div className="actions span-2">
-            <button type="button" className="ghost" onClick={resetForm}>
+          {error && <p className="error-msg">{error}</p>}
+
+          <div className="actions">
+            <button type="button" className="ghost" onClick={reset}>
               Reset
             </button>
-            <button
-              type="button"
-              className="primary"
-              disabled={isGenerating}
-              onClick={generateDocx}
-            >
-              {isGenerating ? 'Working...' : 'Generate DOCX'}
-            </button>
-            <button
-              type="button"
-              className="primary"
-              disabled={isGenerating}
-              onClick={generatePdf}
-            >
-              {isGenerating ? 'Working...' : 'Export PDF'}
-            </button>
+            <div className="actions-end">
+              <button
+                type="button"
+                className="primary"
+                disabled={isGenerating}
+                onClick={exportDocx}
+              >
+                {isGenerating ? 'Exporting...' : 'Export DOCX'}
+              </button>
+              <button
+                type="button"
+                className="primary"
+                disabled={isGenerating}
+                onClick={exportPdf}
+              >
+                {isGenerating ? 'Exporting...' : 'Export PDF'}
+              </button>
+            </div>
           </div>
         </form>
-
-        {error ? <p className="error-note">{error}</p> : null}
-
-        <section className="preview">
-          <div className="preview-head">
-            <h2>Output</h2>
-          </div>
-
-          {generatedDocxUrl || generatedPdfUrl ? (
-            <div className="downloads">
-              {generatedDocxUrl ? (
-                <a className="download-link" href={generatedDocxUrl} download={`${normalizeText(formData.idNumber) || 'consent-form'}.docx`}>
-                  Download {normalizeText(formData.idNumber) || 'consent-form'}.docx
-                </a>
-              ) : null}
-              {generatedPdfUrl ? (
-                <a className="download-link" href={generatedPdfUrl} download={`${normalizeText(formData.idNumber) || 'consent-form'}.pdf`}>
-                  Download {normalizeText(formData.idNumber) || 'consent-form'}.pdf
-                </a>
-              ) : null}
-            </div>
-          ) : (
-            <p className="placeholder">Generate DOCX or PDF to download it here.</p>
-          )}
-        </section>
-      </section>
+      </div>
     </main>
   )
 }
